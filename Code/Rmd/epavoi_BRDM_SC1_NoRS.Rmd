@@ -1,0 +1,1148 @@
+---
+title: "Results for BRDM: Uncertainty present only in mean toxicity"
+author: "Risk Sciences International (prepared under contract XYZ to US Environmental Protection Agency)"
+output: html_document
+
+---
+
+<p> For interpretation of output, please refer to the [user's guide]((insert appropriate url here))
+```{r setup, include = FALSE}
+if (shiny::isRunning()){ params$progress$set(value=0.11) }
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center")
+options(knitr.kable.NA = '')
+library(data.table)
+library(FinancialMath)
+library(scales)
+library(microbenchmark)
+library(tidyverse)
+library(knitr)
+
+u.range=0.99975
+mu.tox.prior=params$muMeanThreshold
+u.mu.tox.prior=u.sd(params$sigmaMeanThreshold, range=u.range)
+sigma.tox.prior=params$muSDThreshold
+mu.exp.prior=params$muMeanExposure
+sigma.exp.prior=params$muSDExposure
+u.sigma.tox.prior=u.sd(params$sigmaSDExposure, range=u.range)
+u.mu.exp.prior=u.sd(params$sigmaMeanExposure, range=u.range)
+u.sigma.exp.prior=u.sd(params$sigmaSDExposure, range=u.range)
+N=params$population
+if(as.numeric(params$endpoint)==1){V=params$vsl*params$By/1e6}
+if(as.numeric(params$endpoint)==2){V=params$costPerAcuteCase*params$By/1e6}
+t.A=params$a_delay
+t.B=params$b_delay
+ICC.A=params$a_costPerTest/1e6
+ICC.B=params$b_costPerTest/1e6
+TRL=params$TRL
+r=params$sdr
+A.range=params$a_sizeThreshold
+B.range=params$b_sizeThreshold
+lcl=params$lcl
+ucl=params$ucl
+y.TH=params$tHorizon-params$t0+1
+max.CC=params$annualReductionCost/1e6/N
+h=params$controlCostExponent
+
+
+# Whether response surface should be included in the analysis
+RS.grid.level=params$RS_included
+
+# Set up response surface parameters (fine-grid)
+if(RS.grid.level==1){
+  t1.seq=seq(0, 10, by=1)
+  u.mu.tox.posterior.prop.vec.orig=seq(0.1, 0.9, by=0.1)
+  rownames.EVDSI.mat=paste("UR = ", seq(100, 0, length.out=11), "%", sep="")
+  colnames.EVDSI.mat=paste("t =", seq(0, 10, by=1), "years", sep=" ")
+  Uncertainty_Reduction=seq(1, 0, by=-0.1)*100
+  Delay=t1.seq
+}
+
+# Set up response surface parameters (coarse-grid)
+if(RS.grid.level==3){
+  t1.seq=seq(0, 10, by=2)
+  u.mu.tox.posterior.prop.vec.orig=seq(0.2, 0.8, by=0.2)
+  rownames.EVDSI.mat=paste("UR = ", seq(100, 0, length.out=6), "%", sep="")
+  colnames.EVDSI.mat=paste("t =", seq(0, 10, by=2), "years", sep=" ")
+  Uncertainty_Reduction=seq(1, 0, by=-0.2)*100
+  Delay=t1.seq
+}
+
+
+# Set up some variables needed for the VOI analysis
+# Set seed for randomization for replicability
+seed=12345
+set.seed(seed)
+
+# Number of replications (B - sample size for prior uncertainty distribution)
+LP1=10000
+
+# the range (s.d) for sample information discretization
+bounds=15
+
+# Determine the reduced risk by proportional exposure mitigation strategies
+k.vec=seq(0, 99, length.out=199)/100 # 1% ~ 99% reduction in exposure, by 0.5% increment
+k.vec=c(k.vec, 1-10^(-3:-6), 1) # Further reduction in upper tail
+ER.vec=log10(1-k.vec) # amount of exposure reduction in log10 scale
+ER.mat=matrix(rep(ER.vec, LP1), nrow=LP1, byrow=TRUE)
+
+# Discount rate for HC (for TSC)
+disc.rate.HC.cumsum=disc.rate.HC_cumsum(y.TH, r)
+
+# spacing for uncertainty range discretization
+u.range.spacing=0.05
+
+# time for intervention to take effect
+t.eff=0
+
+# Convert Variables
+u.mu.tox.posterior.A=u.sd(A.range, u.range)
+u.mu.tox.posterior.B=u.sd(B.range, u.range)
+sigma_expr.A=sigma_expr_function(u.mu.tox.posterior.A, u.mu.tox.prior)# For test A
+sigma_expr.B=sigma_expr_function(u.mu.tox.posterior.B, u.mu.tox.prior) # For test B
+```
+
+
+***
+### VOI analysis for Test A vs. Test B
+```{r prior}
+if (shiny::isRunning()){ params$progress$set(value=0.21) }
+#---------------------------#
+# Prior Distribution set-up #
+#---------------------------#
+
+mu.tox=mu.tox.prior
+u.mu.tox=u.mu.tox.prior
+sigma.tox=sigma.tox.prior
+mu.exp=mu.exp.prior
+sigma.exp=sigma.exp.prior
+u.sigma.tox=u.sigma.tox.prior
+u.mu.exp=u.mu.exp.prior
+u.sigma.exp=u.sigma.exp.prior
+t.IC=0
+t.imp=2
+t.eff=0
+for.range.mu.tox.raw=seq(-6, 6, by=u.range.spacing)
+pdf.orig=dnorm(for.range.mu.tox.raw) # Determine the weights for expectation calculation
+pdf=pdf.orig/sum(pdf.orig) # Normalize the empirical pdf
+
+
+#----------------------------------------------------#
+
+N.loop=length(for.range.mu.tox.raw) # Number of realized values
+pdf=dnorm(for.range.mu.tox.raw) # Determine the weights for expectation calculation
+pdf=pdf/sum(pdf) # Normalize the empirical pdf
+
+
+# A vector of mu.tox values that will be used to determine the results
+mu.tox.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+# Determine the reduced risk by proportional exposure mitigation strategies
+k.vec=seq(0, 99, length.out=199)/100 # 1% ~ 99% reduction in exposure, by 0.5% increment
+k.vec=c(k.vec, 1-10^(-3:-6), 1) # Further reduction in upper tail
+ER.vec=log10(1-k.vec) # amount of exposure reduction in log10 scale
+ER.mat=matrix(rep(ER.vec, N.loop), nrow=N.loop, byrow=TRUE)
+
+
+# This vector stores mean toxicity value and corresponding risk
+risk.dat=Risk_Function(cbind(mu.tox.vec, sigma.tox, mu.exp, sigma.exp))
+
+
+# Derive vectors of nuisance parameters (for information matrix)
+sigma.tox.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.tox, parameter2=u.sigma.tox)$output
+mu.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=mu.exp, parameter2=u.mu.exp)$output
+sigma.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.exp, parameter2=u.sigma.exp)$output
+
+
+# And make it into a matrix and data.frame
+parameter.matrix=cbind(mu.tox.vec, sigma.tox.vec, mu.exp.vec, sigma.exp.vec)
+parameter.df=as.data.frame(cbind(1:N.loop, parameter.matrix))
+
+
+# Data.frame containing parameters, risk, and pdf values
+risk.realized.dat=Risk_Function(parameter.matrix) # Test- working fine for now - plot takes a while to process
+risk.realized=risk.realized.dat$results
+risk.inside.realized=risk.realized.dat$risk.inside
+realized.information.df=as.data.frame(cbind(1:N.loop, for.range.mu.tox.raw, parameter.matrix, risk.inside.realized, risk.realized, pdf))
+names(realized.information.df)[1]="i"
+names(realized.information.df)[2]="mu.tox.raw"
+names(realized.information.df)[3]="mu.tox"
+names(realized.information.df)[4]="sigma.tox"
+names(realized.information.df)[5]="mu.exp"
+names(realized.information.df)[6]="sigma.exp"
+names(realized.information.df)[7]="risk.inside"
+names(realized.information.df)[8]="risk"
+names(realized.information.df)[9]="pdf"
+
+
+#----------------------------------------------------#
+
+#---------------------------------#
+# Calculation of the reduced risk #
+#---------------------------------#
+
+mu.exp.reduced=mu.exp.vec+ER.mat # Matrix of reduced exposure to calculate reduced risk
+
+risk.realized.reduced.mat=NULL
+risk.realized.reduced.mat=mu.exp.reduced
+length.k=length(k.vec)
+for (loc.k in 1:length.k){
+  realized.information.reduced.df=as.data.frame(parameter.matrix)
+  realized.information.reduced.df$mu.exp.vec=mu.exp.reduced[,loc.k]
+  risk.realized.reduced.dat=Risk_Function(realized.information.reduced.df)
+  risk.realized.reduced.mat[,loc.k]=as.numeric(risk.realized.reduced.dat$results)
+}
+
+
+#----------------------------------------------------#
+
+#-----------------#
+# TSC Computation #
+#-----------------#
+
+# Acquire timeline
+y.imp=1+t.imp+t.IC
+y.eff=y.imp+t.eff
+
+# Derive components for Health Cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+# These will need to be multiplied by unregulated risks and regulated risks
+NV.disc.rate.inv.cumsum.pre.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 1]
+NV.disc.rate.inv.cumsum.post.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 2]
+
+
+# For Control Cost (for TSC)
+N.disc.rate.inv.cumsum.post.imp=N*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.imp, 2]
+
+
+# Derive health cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+
+
+HC.pre.eff=realized.information.df$risk*NV.disc.rate.inv.cumsum.pre.eff
+HC.post.eff=risk.realized.reduced.mat*NV.disc.rate.inv.cumsum.post.eff
+
+
+# Combine Health Cost before/after the mitigation effect
+HC.TSC=HC.pre.eff+HC.post.eff
+
+mean.HC.TSC=apply(HC.TSC, 2, mean)
+
+#----------#
+
+# Derive Control Cost (which is independent of risk level)
+CC.TSC=CC.k(k.vec, max.CC, h)*N.disc.rate.inv.cumsum.post.imp
+
+
+#----------#
+
+# Create a matrix that has TSC for all realized risk and k
+CC.TSC.mat=matrix(rep(CC.TSC, N.loop), nrow=N.loop, byrow=TRUE)
+TSC.all=HC.TSC+CC.TSC.mat # matrix to obtain EV|PI
+pdf.mat=matrix(rep(pdf, length(k.vec)), ncol=length(k.vec), byrow=FALSE)
+TSC.all.weighted=TSC.all*pdf.mat # TSC matrix is weighted so that expected value will be appropriate
+
+
+#----------------------------------------------------#
+
+#--------------#
+# Obtain EV|CI #
+#--------------#
+
+# Obtain EV|CI by combining HC and CC information
+ETSC.min=min(apply(TSC.all.weighted, 2, sum))
+loc.k.opt=which(apply(TSC.all.weighted, 2, sum)==ETSC.min)
+k.opt=k.vec[loc.k.opt]
+
+ETSC.0.vec=(CC.TSC[loc.k.opt]+HC.TSC[,loc.k.opt])*pdf
+
+EV.CI=ETSC.min
+k.opt.prior=k.opt
+
+#----------------------------------------------------#
+#--------------#
+# Obtain EV|PI #
+#--------------#
+
+ETSC.star.vec=apply(TSC.all.weighted, 1, min) # A vector in which the average equals the EV|PI
+EV.IPI=sum(ETSC.star.vec)
+EVIPI=EV.CI-EV.IPI
+
+k.equal.0.PTI.vec=loc.kstar.prior.vec=NULL
+for (ind in 1:dim(TSC.all)[1]){
+  loc.kstar.prior=which(TSC.all[ind,]==min(TSC.all[ind,]))
+  loc.kstar.prior.vec=c(loc.kstar.prior.vec, loc.kstar.prior)
+  if(loc.kstar.prior>1){k.equal.0=0}
+  if(loc.kstar.prior==1){k.equal.0=1}
+  k.equal.0.PTI.vec=c(k.equal.0.PTI.vec, k.equal.0)
+}
+PD1.PTI=1-sum(k.equal.0.PTI.vec*pdf)
+
+
+```
+
+
+```{r posterior A pt1}
+if (shiny::isRunning()){ params$progress$set(value=0.37) }
+#------------------------#
+# For Posterior (Test.A) #
+#------------------------#
+
+mu.tox=mu.tox.prior
+N.loop=length(for.range.mu.tox.raw) # Number of realized values
+
+
+# A vector of mu.tox values that will be used to determine the results
+mu.tox.prior.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+# Attempting to obtain unconditional pdf for sample information s_j
+s.j.vec=seq(-15, 15, by=u.range.spacing)*u.mu.tox.prior+mu.tox.prior # this is wider than the original uncertainty range to ensure the chance s_j can be more extreme
+f.sj.mu.tox.mat=NULL
+f.sj.vec.orig=NULL
+
+
+sigma_expr=sigma_expr.A
+for(i2 in 1:length(s.j.vec)){
+  s.j=s.j.vec[i2]
+
+  f.sj.mu.tox.vec=NULL
+  for(i3 in 1:length(mu.tox.prior.vec)){
+    mu.tox.test=mu.tox.prior.vec[i3]
+    f.sj.mu.tox=dnorm(s.j, mean=mu.tox.test, sd=sigma_expr)
+    f.sj.mu.tox.vec=c(f.sj.mu.tox.vec, f.sj.mu.tox)
+  }
+  f.sj.vec.orig=c(f.sj.vec.orig, sum(f.sj.mu.tox.vec*pdf))
+  f.sj.mu.tox.mat=cbind(f.sj.mu.tox.mat, f.sj.mu.tox.vec)
+}
+
+f.sj.vec=f.sj.vec.orig/sum(f.sj.vec.orig)
+mu.tox.sample.vec=s.j.vec
+
+
+#-------##-------##-------##-------#
+# SET UP VARIABLES FOR TEST.A
+
+# sigma_expr=sigma_expr.A
+u.mu.tox.posterior=u.mu.tox.posterior.A
+
+
+mu.tox.posterior.mat=NULL
+mu.mu.tox.posterior.vec=NULL
+mu.tox.sample.inv.vec=NULL
+
+
+# Find out the sample information value such that the posterior will be evaluated at the same location as prior
+for(i4 in 1:length(mu.tox.sample.vec)){
+  mu.mu.tox.posterior.vec.dat=Normal_Bayesian_Updating_mean(n.expr=1, sigma_expr=sigma_expr, mu_mu_prior=mu.tox.prior, s_j=mu.tox.sample.vec[i4], mu_sigma_prior=u.mu.tox.prior)
+  mu.mu.tox.posterior.vec=c(mu.mu.tox.posterior.vec, mu.mu.tox.posterior.vec.dat$mu_mu_posterior)
+}
+
+
+#-------##-------##-------##-------#
+
+# OBTAIN EV|ISI FOR TEST.A
+
+
+t.IC=0
+posterior.realized.information.summary.df=NULL
+for.local.ETSC=NULL
+TSC.true.mat=NULL
+ETSC.vec=NULL
+for(i5 in 1:length(mu.mu.tox.posterior.vec)){
+  # print(i)
+  mu.tox.posterior.vec=for.range.mu.tox.raw*u.mu.tox.posterior+mu.mu.tox.posterior.vec[i5]
+  mu.tox=mu.mu.tox.posterior.vec[i5]
+  u.mu.tox=u.mu.tox.posterior
+
+  N.loop=length(for.range.mu.tox.raw) # Number of realized values
+  pdf=dnorm(for.range.mu.tox.raw) # Determine the weights for expectation calculation
+  pdf=pdf/sum(pdf) # Normalize the empirical pdf
+
+  # A vector of mu.tox values that will be used to determine the results
+  mu.tox.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+  # Determine the reduced risk by proportional exposure mitigation strategies
+  k.vec=seq(0, 99, length.out=199)/100 # 1% ~ 99% reduction in exposure, by 0.5% increment
+  k.vec=c(k.vec, 1-10^(-3:-6), 1) # Further reduction in upper tail
+  ER.vec=log10(1-k.vec) # amount of exposure reduction in log10 scale
+  ER.mat=matrix(rep(ER.vec, N.loop), nrow=N.loop, byrow=TRUE)
+
+
+  # This vector stores mean toxicity value and corresponding risk
+  risk.dat=Risk_Function(cbind(mu.tox.vec, sigma.tox, mu.exp, sigma.exp))
+
+
+  # Derive vectors of nuisance parameters (for information matrix)
+  sigma.tox.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.tox, parameter2=u.sigma.tox)$output
+  mu.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=mu.exp, parameter2=u.mu.exp)$output
+  sigma.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.exp, parameter2=u.sigma.exp)$output
+
+  # And make it into a matrix and data.frame
+  parameter.matrix=cbind(mu.tox.vec, sigma.tox.vec, mu.exp.vec, sigma.exp.vec)
+  parameter.df=as.data.frame(cbind(1:N.loop, parameter.matrix))
+
+
+  # Data.frame containing parameters, risk, and pdf values
+  risk.realized.dat=Risk_Function(parameter.matrix) # Test- working fine for now - plot takes a while to process
+  risk.realized=risk.realized.dat$results
+  risk.inside.realized=risk.realized.dat$risk.inside
+  realized.information.df=as.data.frame(cbind(1:N.loop, for.range.mu.tox.raw, parameter.matrix, risk.inside.realized, risk.realized, pdf))
+  names(realized.information.df)[1]="i"
+  names(realized.information.df)[2]="mu.tox.raw"
+  names(realized.information.df)[3]="mu.tox"
+  names(realized.information.df)[4]="sigma.tox"
+  names(realized.information.df)[5]="mu.exp"
+  names(realized.information.df)[6]="sigma.exp"
+  names(realized.information.df)[7]="risk.inside"
+  names(realized.information.df)[8]="risk"
+  names(realized.information.df)[9]="pdf"
+
+
+  #----------------------------------------------------#
+
+  #---------------------------------#
+  # Calculation of the reduced risk #
+  #---------------------------------#
+
+  mu.exp.reduced=mu.exp.vec+ER.mat # Matrix of reduced exposure to calculate reduced risk
+
+  risk.realized.reduced.mat=NULL
+  risk.realized.reduced.mat=mu.exp.reduced
+  length.k=length(k.vec)
+  for (loc.k in 1:length.k){
+    realized.information.reduced.df=as.data.frame(parameter.matrix)
+    realized.information.reduced.df$mu.exp.vec=mu.exp.reduced[,loc.k]
+    risk.realized.reduced.dat=Risk_Function(realized.information.reduced.df)
+    risk.realized.reduced.mat[,loc.k]=as.numeric(risk.realized.reduced.dat$results)
+  }
+
+
+  #----------------------------------------------------#
+
+  #-----------------#
+  # TSC Computation #
+  #-----------------#
+
+  # Acquire timeline
+  y.imp=1+t.imp+t.IC
+  y.eff=y.imp+t.eff
+
+
+  # Derive components for Health Cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+  # These will need to be multiplied by unregulated risks and regulated risks
+  NV.disc.rate.inv.cumsum.pre.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 1]
+  NV.disc.rate.inv.cumsum.post.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 2]
+
+
+  # For Control Cost (for TSC)
+  N.disc.rate.inv.cumsum.post.imp=N*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.imp, 2]
+
+
+  # Derive health cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+
+
+  HC.pre.eff=realized.information.df$risk*NV.disc.rate.inv.cumsum.pre.eff
+  HC.post.eff=risk.realized.reduced.mat*NV.disc.rate.inv.cumsum.post.eff
+
+
+  # Combine Health Cost before/after the mitigation effect
+  HC.TSC=HC.pre.eff+HC.post.eff
+
+
+  mean.HC.TSC=apply(HC.TSC, 2, mean)
+
+  #----------#
+
+  # Derive Control Cost (which is independent of risk level)
+  CC.TSC=CC.k(k.vec, max.CC, h)*N.disc.rate.inv.cumsum.post.imp
+
+
+  #----------#
+
+  # Create a matrix that has TSC for all realized risk and k
+  CC.TSC.mat=matrix(rep(CC.TSC, N.loop), nrow=N.loop, byrow=TRUE)
+  TSC.all=HC.TSC+CC.TSC.mat # matrix to obtain EV|PI
+  pdf.mat=matrix(rep(pdf, length(k.vec)), ncol=length(k.vec), byrow=FALSE)
+  TSC.all.weighted=TSC.all*pdf.mat # TSC matrix is weighted so that expected value will be appropriate
+
+
+  #----------------------------------------------------#
+
+  #--------------#
+  # Obtain EV|CI #
+  #--------------#
+
+  # Obtain EV|CI by combining HC and CC information
+  ETSC.min=min(apply(TSC.all.weighted, 2, sum))
+  ETSC.vec=c(ETSC.vec, ETSC.min)
+}
+
+
+ETSC.ISI.A.vec=ETSC.vec
+EV.ISI.A=sum(ETSC.ISI.A.vec*f.sj.vec)
+EVISI.A=EV.CI-EV.ISI.A
+
+
+```
+
+
+```{r posterior A pt2}
+# OBTAIN EV|DSI FOR TEST.A
+if (shiny::isRunning()){ params$progress$set(value=0.42) }
+
+t.IC=t.A
+posterior.realized.information.summary.df=NULL
+for.local.ETSC=NULL
+TSC.true.mat=NULL
+ETSC.vec=NULL
+k.equal.0.A.vec=NULL # To calculate the probability P(D=1) and P(D=0)
+
+for(i6 in 1:length(mu.mu.tox.posterior.vec)){
+  mu.tox.posterior.vec=for.range.mu.tox.raw*u.mu.tox.posterior+mu.mu.tox.posterior.vec[i6]
+  mu.tox=mu.mu.tox.posterior.vec[i6]
+  u.mu.tox=u.mu.tox.posterior
+
+  N.loop=length(for.range.mu.tox.raw) # Number of realized values
+  pdf=dnorm(for.range.mu.tox.raw) # Determine the weights for expectation calculation
+  pdf=pdf/sum(pdf) # Normalize the empirical pdf
+
+  # A vector of mu.tox values that will be used to determine the results
+  mu.tox.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+  # Determine the reduced risk by proportional exposure mitigation strategies
+  k.vec=seq(0, 99, length.out=199)/100 # 1% ~ 99% reduction in exposure, by 0.5% increment
+  k.vec=c(k.vec, 1-10^(-3:-6), 1) # Further reduction in upper tail
+  ER.vec=log10(1-k.vec) # amount of exposure reduction in log10 scale
+  ER.mat=matrix(rep(ER.vec, N.loop), nrow=N.loop, byrow=TRUE)
+
+
+  # This vector stores mean toxicity value and corresponding risk
+  risk.dat=Risk_Function(cbind(mu.tox.vec, sigma.tox, mu.exp, sigma.exp))
+
+
+  # Derive vectors of nuisance parameters (for information matrix)
+  sigma.tox.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.tox, parameter2=u.sigma.tox)$output
+  mu.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=mu.exp, parameter2=u.mu.exp)$output
+  sigma.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.exp, parameter2=u.sigma.exp)$output
+
+  # And make it into a matrix and data.frame
+  parameter.matrix=cbind(mu.tox.vec, sigma.tox.vec, mu.exp.vec, sigma.exp.vec)
+  parameter.df=as.data.frame(cbind(1:N.loop, parameter.matrix))
+
+
+  # Data.frame containing parameters, risk, and pdf values
+  risk.realized.dat=Risk_Function(parameter.matrix) # Test- working fine for now - plot takes a while to process
+  risk.realized=risk.realized.dat$results
+  risk.inside.realized=risk.realized.dat$risk.inside
+  realized.information.df=as.data.frame(cbind(1:N.loop, for.range.mu.tox.raw, parameter.matrix, risk.inside.realized, risk.realized, pdf))
+  names(realized.information.df)[1]="i"
+  names(realized.information.df)[2]="mu.tox.raw"
+  names(realized.information.df)[3]="mu.tox"
+  names(realized.information.df)[4]="sigma.tox"
+  names(realized.information.df)[5]="mu.exp"
+  names(realized.information.df)[6]="sigma.exp"
+  names(realized.information.df)[7]="risk.inside"
+  names(realized.information.df)[8]="risk"
+  names(realized.information.df)[9]="pdf"
+
+
+  #----------------------------------------------------#
+
+  #---------------------------------#
+  # Calculation of the reduced risk #
+  #---------------------------------#
+
+  mu.exp.reduced=mu.exp.vec+ER.mat # Matrix of reduced exposure to calculate reduced risk
+
+  risk.realized.reduced.mat=NULL
+  risk.realized.reduced.mat=mu.exp.reduced
+  length.k=length(k.vec)
+  for (loc.k in 1:length.k){
+    realized.information.reduced.df=as.data.frame(parameter.matrix)
+    realized.information.reduced.df$mu.exp.vec=mu.exp.reduced[,loc.k]
+    risk.realized.reduced.dat=Risk_Function(realized.information.reduced.df)
+    risk.realized.reduced.mat[,loc.k]=as.numeric(risk.realized.reduced.dat$results)
+  }
+
+
+  #----------------------------------------------------#
+
+  #-----------------#
+  # TSC Computation #
+  #-----------------#
+
+  # Acquire timeline
+  y.imp=1+t.imp+t.IC
+  y.eff=y.imp+t.eff
+
+
+  # Derive components for Health Cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+  # These will need to be multiplied by unregulated risks and regulated risks
+  NV.disc.rate.inv.cumsum.pre.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 1]
+  NV.disc.rate.inv.cumsum.post.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 2]
+
+
+  # For Control Cost (for TSC)
+  N.disc.rate.inv.cumsum.post.imp=N*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.imp, 2]
+
+
+  # Derive health cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+
+
+  HC.pre.eff=realized.information.df$risk*NV.disc.rate.inv.cumsum.pre.eff
+  HC.post.eff=risk.realized.reduced.mat*NV.disc.rate.inv.cumsum.post.eff
+
+
+  # Combine Health Cost before/after the mitigation effect
+  HC.TSC=HC.pre.eff+HC.post.eff
+
+
+  mean.HC.TSC=apply(HC.TSC, 2, mean)
+
+  #----------#
+
+  # Derive Control Cost (which is independent of risk level)
+  CC.TSC=CC.k(k.vec, max.CC, h)*N.disc.rate.inv.cumsum.post.imp
+
+
+  #----------#
+
+  # Create a matrix that has TSC for all realized risk and k
+  CC.TSC.mat=matrix(rep(CC.TSC, N.loop), nrow=N.loop, byrow=TRUE)
+  TSC.all=HC.TSC+CC.TSC.mat # matrix to obtain EV|PI
+  pdf.mat=matrix(rep(pdf, length(k.vec)), ncol=length(k.vec), byrow=FALSE)
+  TSC.all.weighted=TSC.all*pdf.mat # TSC matrix is weighted so that expected value will be appropriate
+
+
+  #----------------------------------------------------#
+
+  #--------------#
+  # Obtain EV|CI #
+  #--------------#
+
+  # Obtain EV|CI by combining HC and CC information
+  ETSC.min=min(apply(TSC.all.weighted, 2, sum))
+  ETSC.vec=c(ETSC.vec, ETSC.min)
+  
+  loc.k.A=which(apply(TSC.all.weighted, 2, sum)==ETSC.min)
+  if(loc.k.A>1){k.equal.0=0}
+  if(loc.k.A==1){k.equal.0=1}
+  k.equal.0.A.vec=c(k.equal.0.A.vec, k.equal.0)
+}
+
+
+ETSC.DSI.A.vec=ETSC.vec
+EV.DSI.A=sum(ETSC.DSI.A.vec*f.sj.vec)
+EVDSI.A=EV.CI-EV.DSI.A
+PD.equal.0.A=sum(k.equal.0.A.vec*f.sj.vec)
+PD1.A=1-PD.equal.0.A
+
+
+```
+
+
+```{r posterior B pt1}
+if (shiny::isRunning()){ params$progress$set(value=0.53) }
+#------------------------#
+# For Posterior (Test.B) #
+#------------------------#
+
+mu.tox=mu.tox.prior
+u.mu.tox=u.mu.tox.prior
+N.loop=length(for.range.mu.tox.raw) # Number of realized values
+
+
+# A vector of mu.tox values that will be used to determine the results
+mu.tox.prior.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+# Attempting to obtain unconditional pdf for sample information s_j
+s.j.vec=seq(-15, 15, by=u.range.spacing)*u.mu.tox.prior+mu.tox.prior # this is wider than the original uncertainty range to ensure the chance s_j can be more extreme
+f.sj.mu.tox.mat=NULL
+f.sj.vec.orig=NULL
+
+
+sigma_expr=sigma_expr.B
+for(i7 in 1:length(s.j.vec)){
+  s.j=s.j.vec[i7]
+
+  f.sj.mu.tox.vec=NULL
+  for(i8 in 1:length(mu.tox.prior.vec)){
+    mu.tox.test=mu.tox.prior.vec[i8]
+    f.sj.mu.tox=dnorm(s.j, mean=mu.tox.test, sd=sigma_expr)
+    f.sj.mu.tox.vec=c(f.sj.mu.tox.vec, f.sj.mu.tox)
+  }
+  # print(sum(f.sj.mu.tox.vec*pdf))
+  f.sj.vec.orig=c(f.sj.vec.orig, sum(f.sj.mu.tox.vec*pdf))
+  f.sj.mu.tox.mat=cbind(f.sj.mu.tox.mat, f.sj.mu.tox.vec)
+}
+
+f.sj.vec=f.sj.vec.orig/sum(f.sj.vec.orig)
+mu.tox.sample.vec=s.j.vec
+
+
+#-------##-------##-------##-------#
+# SET UP VARIABLES FOR TEST.B
+
+u.mu.tox.posterior=u.mu.tox.posterior.B
+
+
+mu.tox.posterior.mat=NULL
+mu.mu.tox.posterior.vec=NULL
+mu.tox.sample.inv.vec=NULL
+
+
+# Find out the sample information value such that the posterior will be evaluated at the same location as prior
+for(i9 in 1:length(mu.tox.sample.vec)){
+  mu.mu.tox.posterior.vec.dat=Normal_Bayesian_Updating_mean(n.expr=1, sigma_expr=sigma_expr, mu_mu_prior=mu.tox.prior, s_j=mu.tox.sample.vec[i9], mu_sigma_prior=u.mu.tox.prior)
+  mu.mu.tox.posterior.vec=c(mu.mu.tox.posterior.vec, mu.mu.tox.posterior.vec.dat$mu_mu_posterior)
+}
+
+
+#-------##-------##-------##-------#
+
+# OBTAIN EV|ISI FOR TEST.B
+
+
+t.IC=0
+posterior.realized.information.summary.df=NULL
+for.local.ETSC=NULL
+TSC.true.mat=NULL
+ETSC.vec=NULL
+for(i10 in 1:length(mu.mu.tox.posterior.vec)){
+  mu.tox.posterior.vec=for.range.mu.tox.raw*u.mu.tox.posterior+mu.mu.tox.posterior.vec[i10]
+  mu.tox=mu.mu.tox.posterior.vec[i10]
+  u.mu.tox=u.mu.tox.posterior
+
+  N.loop=length(for.range.mu.tox.raw) # Number of realized values
+  pdf=dnorm(for.range.mu.tox.raw) # Determine the weights for expectation calculation
+  pdf=pdf/sum(pdf) # Normalize the empirical pdf
+
+  # A vector of mu.tox values that will be used to determine the results
+  mu.tox.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+  # Determine the reduced risk by proportional exposure mitigation strategies
+  k.vec=seq(0, 99, length.out=199)/100 # 1% ~ 99% reduction in exposure, by 0.5% increment
+  k.vec=c(k.vec, 1-10^(-3:-6), 1) # Further reduction in upper tail
+  ER.vec=log10(1-k.vec) # amount of exposure reduction in log10 scale
+  ER.mat=matrix(rep(ER.vec, N.loop), nrow=N.loop, byrow=TRUE)
+
+
+  # This vector stores mean toxicity value and corresponding risk
+  risk.dat=Risk_Function(cbind(mu.tox.vec, sigma.tox, mu.exp, sigma.exp))
+
+
+  # Derive vectors of nuisance parameters (for information matrix)
+  sigma.tox.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.tox, parameter2=u.sigma.tox)$output
+  mu.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=mu.exp, parameter2=u.mu.exp)$output
+  sigma.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.exp, parameter2=u.sigma.exp)$output
+
+  # And make it into a matrix and data.frame
+  parameter.matrix=cbind(mu.tox.vec, sigma.tox.vec, mu.exp.vec, sigma.exp.vec)
+  parameter.df=as.data.frame(cbind(1:N.loop, parameter.matrix))
+
+
+  # Data.frame containing parameters, risk, and pdf values
+  risk.realized.dat=Risk_Function(parameter.matrix) # Test- working fine for now - plot takes a while to process
+  risk.realized=risk.realized.dat$results
+  risk.inside.realized=risk.realized.dat$risk.inside
+  realized.information.df=as.data.frame(cbind(1:N.loop, for.range.mu.tox.raw, parameter.matrix, risk.inside.realized, risk.realized, pdf))
+  names(realized.information.df)[1]="i"
+  names(realized.information.df)[2]="mu.tox.raw"
+  names(realized.information.df)[3]="mu.tox"
+  names(realized.information.df)[4]="sigma.tox"
+  names(realized.information.df)[5]="mu.exp"
+  names(realized.information.df)[6]="sigma.exp"
+  names(realized.information.df)[7]="risk.inside"
+  names(realized.information.df)[8]="risk"
+  names(realized.information.df)[9]="pdf"
+
+
+  #----------------------------------------------------#
+
+  #---------------------------------#
+  # Calculation of the reduced risk #
+  #---------------------------------#
+
+  mu.exp.reduced=mu.exp.vec+ER.mat # Matrix of reduced exposure to calculate reduced risk
+
+  risk.realized.reduced.mat=NULL
+  risk.realized.reduced.mat=mu.exp.reduced
+  length.k=length(k.vec)
+  for (loc.k in 1:length.k){
+    realized.information.reduced.df=as.data.frame(parameter.matrix)
+    realized.information.reduced.df$mu.exp.vec=mu.exp.reduced[,loc.k]
+    risk.realized.reduced.dat=Risk_Function(realized.information.reduced.df)
+    risk.realized.reduced.mat[,loc.k]=as.numeric(risk.realized.reduced.dat$results)
+  }
+
+
+  #----------------------------------------------------#
+
+  #-----------------#
+  # TSC Computation #
+  #-----------------#
+
+  # Acquire timeline
+  y.imp=1+t.imp+t.IC
+  y.eff=y.imp+t.eff
+
+
+  # Derive components for Health Cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+  # These will need to be multiplied by unregulated risks and regulated risks
+  NV.disc.rate.inv.cumsum.pre.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 1]
+  NV.disc.rate.inv.cumsum.post.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 2]
+
+
+  # For Control Cost (for TSC)
+  N.disc.rate.inv.cumsum.post.imp=N*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.imp, 2]
+
+
+  # Derive health cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+
+
+  HC.pre.eff=realized.information.df$risk*NV.disc.rate.inv.cumsum.pre.eff
+  HC.post.eff=risk.realized.reduced.mat*NV.disc.rate.inv.cumsum.post.eff
+
+
+  # Combine Health Cost before/after the mitigation effect
+  HC.TSC=HC.pre.eff+HC.post.eff
+
+
+  mean.HC.TSC=apply(HC.TSC, 2, mean)
+
+  #----------#
+
+  # Derive Control Cost (which is independent of risk level)
+  CC.TSC=CC.k(k.vec, max.CC, h)*N.disc.rate.inv.cumsum.post.imp
+
+
+  #----------#
+
+  # Create a matrix that has TSC for all realized risk and k
+  CC.TSC.mat=matrix(rep(CC.TSC, N.loop), nrow=N.loop, byrow=TRUE)
+  TSC.all=HC.TSC+CC.TSC.mat # matrix to obtain EV|PI
+  pdf.mat=matrix(rep(pdf, length(k.vec)), ncol=length(k.vec), byrow=FALSE)
+  TSC.all.weighted=TSC.all*pdf.mat # TSC matrix is weighted so that expected value will be appropriate
+
+
+  #----------------------------------------------------#
+
+  #--------------#
+  # Obtain EV|CI #
+  #--------------#
+
+  # Obtain EV|CI by combining HC and CC information
+  ETSC.min=min(apply(TSC.all.weighted, 2, sum))
+  ETSC.vec=c(ETSC.vec, ETSC.min)
+}
+
+ETSC.ISI.B.vec=ETSC.vec
+EV.ISI.B=sum(ETSC.ISI.B.vec*f.sj.vec)
+EVISI.B=EV.CI-EV.ISI.B
+
+
+
+```
+
+
+```{r posterior B pt2}
+if (shiny::isRunning()){ params$progress$set(value=0.63) }
+t.IC=t.B
+posterior.realized.information.summary.df=NULL
+for.local.ETSC=NULL
+TSC.true.mat=NULL
+ETSC.vec=NULL
+k.equal.0.B.vec=NULL # To calculate the probability P(D=1) and P(D=0)
+
+for(i11 in 1:length(mu.mu.tox.posterior.vec)){
+  mu.tox.posterior.vec=for.range.mu.tox.raw*u.mu.tox.posterior+mu.mu.tox.posterior.vec[i11]
+  mu.tox=mu.mu.tox.posterior.vec[i11]
+  u.mu.tox=u.mu.tox.posterior
+
+  N.loop=length(for.range.mu.tox.raw) # Number of realized values
+  pdf=dnorm(for.range.mu.tox.raw) # Determine the weights for expectation calculation
+  pdf=pdf/sum(pdf) # Normalize the empirical pdf
+
+  # A vector of mu.tox values that will be used to determine the results
+  mu.tox.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+  # Determine the reduced risk by proportional exposure mitigation strategies
+  k.vec=seq(0, 99, length.out=199)/100 # 1% ~ 99% reduction in exposure, by 0.5% increment
+  k.vec=c(k.vec, 1-10^(-3:-6), 1) # Further reduction in upper tail
+  ER.vec=log10(1-k.vec) # amount of exposure reduction in log10 scale
+  ER.mat=matrix(rep(ER.vec, N.loop), nrow=N.loop, byrow=TRUE)
+
+
+  # This vector stores mean toxicity value and corresponding risk
+  risk.dat=Risk_Function(cbind(mu.tox.vec, sigma.tox, mu.exp, sigma.exp))
+
+
+  # Derive vectors of nuisance parameters (for information matrix)
+  sigma.tox.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.tox, parameter2=u.sigma.tox)$output
+  mu.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=mu.exp, parameter2=u.mu.exp)$output
+  sigma.exp.vec=Normal_Uncertainty_Generator(N.loop, parameter1=sigma.exp, parameter2=u.sigma.exp)$output
+
+  # And make it into a matrix and data.frame
+  parameter.matrix=cbind(mu.tox.vec, sigma.tox.vec, mu.exp.vec, sigma.exp.vec)
+  parameter.df=as.data.frame(cbind(1:N.loop, parameter.matrix))
+
+
+  # Data.frame containing parameters, risk, and pdf values
+  risk.realized.dat=Risk_Function(parameter.matrix) # Test- working fine for now - plot takes a while to process
+  risk.realized=risk.realized.dat$results
+  risk.inside.realized=risk.realized.dat$risk.inside
+  realized.information.df=as.data.frame(cbind(1:N.loop, for.range.mu.tox.raw, parameter.matrix, risk.inside.realized, risk.realized, pdf))
+  names(realized.information.df)[1]="i"
+  names(realized.information.df)[2]="mu.tox.raw"
+  names(realized.information.df)[3]="mu.tox"
+  names(realized.information.df)[4]="sigma.tox"
+  names(realized.information.df)[5]="mu.exp"
+  names(realized.information.df)[6]="sigma.exp"
+  names(realized.information.df)[7]="risk.inside"
+  names(realized.information.df)[8]="risk"
+  names(realized.information.df)[9]="pdf"
+
+
+  #----------------------------------------------------#
+
+  #---------------------------------#
+  # Calculation of the reduced risk #
+  #---------------------------------#
+
+  mu.exp.reduced=mu.exp.vec+ER.mat # Matrix of reduced exposure to calculate reduced risk
+
+  risk.realized.reduced.mat=NULL
+  risk.realized.reduced.mat=mu.exp.reduced
+  length.k=length(k.vec)
+  for (loc.k in 1:length.k){
+    realized.information.reduced.df=as.data.frame(parameter.matrix)
+    realized.information.reduced.df$mu.exp.vec=mu.exp.reduced[,loc.k]
+    risk.realized.reduced.dat=Risk_Function(realized.information.reduced.df)
+    risk.realized.reduced.mat[,loc.k]=as.numeric(risk.realized.reduced.dat$results)
+  }
+
+
+  #----------------------------------------------------#
+
+  #-----------------#
+  # TSC Computation #
+  #-----------------#
+
+  # Acquire timeline
+  y.imp=1+t.imp+t.IC
+  y.eff=y.imp+t.eff
+
+
+  # Derive components for Health Cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+  # These will need to be multiplied by unregulated risks and regulated risks
+  NV.disc.rate.inv.cumsum.pre.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 1]
+  NV.disc.rate.inv.cumsum.post.eff=N*V*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.eff, 2]
+
+
+  # For Control Cost (for TSC)
+  N.disc.rate.inv.cumsum.post.imp=N*disc.rate.HC.cumsum$disc.rate.inv.cumsum[y.imp, 2]
+
+
+  # Derive health cost (for TSC) pre-mitigation and post-mitigation (effect observed)
+
+
+  HC.pre.eff=realized.information.df$risk*NV.disc.rate.inv.cumsum.pre.eff
+  HC.post.eff=risk.realized.reduced.mat*NV.disc.rate.inv.cumsum.post.eff
+
+
+  # Combine Health Cost before/after the mitigation effect
+  HC.TSC=HC.pre.eff+HC.post.eff
+
+
+  mean.HC.TSC=apply(HC.TSC, 2, mean)
+
+  #----------#
+
+  # Derive Control Cost (which is independent of risk level)
+  CC.TSC=CC.k(k.vec, max.CC, h)*N.disc.rate.inv.cumsum.post.imp
+
+
+  #----------#
+
+  # Create a matrix that has TSC for all realized risk and k
+  CC.TSC.mat=matrix(rep(CC.TSC, N.loop), nrow=N.loop, byrow=TRUE)
+  TSC.all=HC.TSC+CC.TSC.mat # matrix to obtain EV|PI
+  pdf.mat=matrix(rep(pdf, length(k.vec)), ncol=length(k.vec), byrow=FALSE)
+  TSC.all.weighted=TSC.all*pdf.mat # TSC matrix is weighted so that expected value will be appropriate
+
+
+  #----------------------------------------------------#
+
+  #--------------#
+  # Obtain EV|CI #
+  #--------------#
+
+  # Obtain EV|CI by combining HC and CC information
+  ETSC.min=min(apply(TSC.all.weighted, 2, sum))
+  ETSC.vec=c(ETSC.vec, ETSC.min)
+  
+  loc.k.B=which(apply(TSC.all.weighted, 2, sum)==ETSC.min)
+  if(loc.k.B>1){k.equal.0=0}
+  if(loc.k.B==1){k.equal.0=1}
+  k.equal.0.B.vec=c(k.equal.0.B.vec, k.equal.0)
+}
+
+
+ETSC.DSI.B.vec=ETSC.vec
+EV.DSI.B=sum(ETSC.DSI.B.vec*f.sj.vec)
+EVDSI.B=EV.CI-EV.DSI.B
+PD.equal.0.B=sum(k.equal.0.B.vec*f.sj.vec)
+PD1.B=1-PD.equal.0.B
+
+```
+
+
+```{r output AB}
+if (shiny::isRunning()){ params$progress$set(value=0.74) }
+#--------#
+# OUTPUT #
+#--------#
+
+EVISI.A=EV.CI-EV.ISI.A
+EVISI.B=EV.CI-EV.ISI.B
+EVDSI.A=EV.CI-EV.DSI.A
+EVDSI.B=EV.CI-EV.DSI.B
+
+
+CoD.A=EV.DSI.A-EV.ISI.A
+CoD.B=EV.DSI.B-EV.ISI.B
+ENBS.A=EV.CI-EV.DSI.A-ICC.A
+ENBS.B=EV.CI-EV.DSI.B-ICC.B
+ROI.A=ENBS.A/ICC.A
+ROI.B=ENBS.B/ICC.B
+prior.VOI=c(EV.CI, EVIPI)
+
+
+k.opt.perc=round(100*k.opt.prior)
+EV.CI.fmt=round(EV.CI)
+EVIPI.fmt=round(EVIPI)
+EVISI.A.perc=round(100*EVISI.A/EVIPI)
+EVDSI.A.perc=round(100*EVDSI.A/EVIPI)
+EVISI.B.perc=round(100*EVISI.B/EVIPI)
+EVDSI.B.perc=round(100*EVDSI.B/EVIPI)
+EVISI.A.fmt=round(EVISI.A)
+EVDSI.A.fmt=round(EVDSI.A)
+EVISI.B.fmt=round(EVISI.B)
+EVDSI.B.fmt=round(EVDSI.B)
+CoD.A.fmt=round(CoD.A)
+CoD.B.fmt=round(CoD.B)
+CoD.A.perc=round(100*CoD.A/EVIPI)
+CoD.B.perc=round(100*CoD.B/EVIPI)
+ENBS.A.fmt=round(ENBS.A)
+ENBS.A.perc=round(100*ENBS.A/EVIPI)
+ENBS.B.fmt=round(ENBS.B)
+ENBS.B.perc=round(100*ENBS.B/EVIPI)
+ROI.A.fmt=round(ROI.A)
+ROI.B.fmt=round(ROI.B)
+
+VOI.summary=rbind(c(k.opt.perc, rep(NA, 3)), c(EV.CI.fmt, rep(NA, 3)), c(EVIPI.fmt, rep(NA, 3)),
+                   c(EVISI.A.fmt, EVISI.A.perc, EVISI.B.fmt, EVISI.B.perc), c(CoD.A.fmt, CoD.A.perc, CoD.B.fmt, CoD.B.perc),
+                   c(EVDSI.A.fmt, EVDSI.A.perc, EVDSI.B.fmt, EVDSI.B.perc), c(ENBS.A.fmt, ENBS.A.perc, ENBS.B.fmt, ENBS.B.perc),
+                   c(ROI.A.fmt, NA, ROI.B.fmt, NA))
+
+rownames(VOI.summary)=c("k0", "EV|CI", "EVIPI", "EVISI", "CoD", "EVDSI", "ENBS", "ROI")
+
+# Formatting VOI summary information (EV|CI and EVIPPI)
+VOI.summary.prior.information=rbind(c(NA, k.opt.perc), c(EV.CI.fmt, NA), c(EVIPI.fmt, NA))
+colnames(VOI.summary.prior.information)=c("(&#x0024;M)", "(&#x0025;)")
+rownames(VOI.summary.prior.information)=c("Optimal Reduction in Exposure (ORE)", "Expected Value Given Current Information (EV|CI)", "Expected Value of Immediate Perfect Information (EVIPI)")
+kable(VOI.summary.prior.information, caption="VOI summary (part 1) - Current information and immediate perfect information", align = rep("r", 2), format.args = list(big.mark = ","))
+
+# Formatting VOI summary information for Test A and Test B (EVISI,...,ROI)
+VOI.summary.posterior.information=rbind(c(EVISI.A.fmt, EVISI.A.perc, EVISI.B.fmt, EVISI.B.perc), c(CoD.A.fmt, CoD.A.perc, CoD.B.fmt, CoD.B.perc),
+                   c(EVDSI.A.fmt, EVDSI.A.perc, EVDSI.B.fmt, EVDSI.B.perc), c(ENBS.A.fmt, ENBS.A.perc, ENBS.B.fmt, ENBS.B.perc),
+                   c(ROI.A.fmt, NA, ROI.B.fmt, NA))
+
+
+colnames(VOI.summary.posterior.information)=c("Test A (&#x0024;M)", "Test A (&#x0025;)", "Test B (&#x0024;M)", "Test B (&#x0025;)")
+rownames(VOI.summary.posterior.information)=c("Expected Value of Immediate Sample Information (EVISI)", "Cost of Delay (CoD)", "Expected Value of Delayed Sample Information (EVDSI)", "Expected Net Benefit of Sampling (ENBS)", "Return on Investment (ROI)")
+
+
+kable(VOI.summary.posterior.information, caption="VOI summary (part 2) - Test A vs. Test B (% given with respect to EVIPI)", escape=FALSE, align = rep("r", 4), format.args = list(big.mark = ","))
+
+
+PD0.PTI=1-PD1.PTI
+PD0.A=1-PD1.A
+PD0.B=1-PD1.B
+DRI.PTI=c(PD1.PTI, PD0.PTI, 0)
+DRI.A=c(PD1.A, PD0.A, 0)
+DRI.B=c(PD1.B, PD0.B, 0)
+
+DRI.summary=rbind(DRI.PTI, DRI.A, DRI.B)
+DRI.summary.signif=signif(DRI.summary*100, digits=3)
+colnames(DRI.summary.signif)=c("P(decision to regulate) (&#x0025;)", "P(decision not to regulate) (&#x0025;)", "P(decision made) (&#x0025;)")
+rownames(DRI.summary.signif)=c("With perfect toxicity information", "With Test A", "With Test B")
+kable(DRI.summary.signif, caption="VOI summary (part 3) - Probability of making decisions", escape=FALSE)
+
+```
+
+
+
+<div style="margin-bottom:100px;">
+***
+### Response surface analysis
+Response surface analysis not conducted.
+```{r plot_RS, echo=FALSE}
+if (shiny::isRunning()){ params$progress$set(value=0.84) }
+#print("Response surface analysis not conducted.")
+
+```
+
+
+
+<div style="margin-bottom:100px;">
+***
+### List of input parameters
+```{r Outputting_Input}
+if (shiny::isRunning()){ params$progress$set(value=0.95) }
+# Decision Rules and Prior Uncertainty
+DR.ind=params$decisionRule
+if(DR.ind==1){DR="BRDM"}
+if(DR.ind==2){DR="TRDM"}
+RS.ind=params$RS_included
+if(RS.ind==1){RS="Yes (with fine-grid)"}
+if(RS.ind==2){RS="No"}
+if(RS.ind==3){RS="Yes (with coarse-grid)"}
+
+Input.parameters.DR=data.frame(rbind(params$TRL, params$ucl, params$lcl, params$muMeanThreshold, params$sigmaMeanThreshold, params$muSDThreshold, params$sigmaSDThreshold, params$muMeanExposure, params$sigmaMeanExposure, params$muSDExposure, params$sigmaSDExposure))
+Input.parameters.DR=rbind(DR, RS, Input.parameters.DR)
+rownames.Input.parameters.DR=c("Decision rule", "Response surface", "TRL", "UCL", "LCL", "$\\mu$<sub>tox</sub>", "Range[u<sup>0</sup>($\\mu$<sub>tox</sub>)]", "$\\sigma$<sub>tox</sub>", "Range[u<sup>0</sup>($\\sigma$<sub>tox</sub>)]", "$\\mu$<sub>exp</sub>", "Range[u<sup>0</sup>($\\mu$<sub>exp</sub>)]", "$\\sigma$<sub>exp</sub>", "Range[u<sup>0</sup>($\\sigma$<sub>exp</sub>)]")
+colnames(Input.parameters.DR)="Value"
+
+
+# Toxicity Test Information
+Input.parameters.TTI=data.frame(rbind(params$a_sizeThreshold, params$a_delay, params$a_costPerTest, params$b_sizeThreshold, params$b_delay, params$b_costPerTest))
+Input.parameters.TTI=rbind(Input.parameters.TTI, NA, NA, NA, NA, NA, NA, NA)
+rownames.Input.parameters.TTI=c("Range[u<sup>A</sup>($\\mu$<sub>tox</sub>)]", "Delay (Test A)", "Cost per test (Test A)", "Range[u<sup>B</sup>($\\mu$<sub>tox</sub>)]", "Delay (Test B)", "Cost per test (Test B)", rep("", 7))
+colnames(Input.parameters.TTI)="Value"
+
+
+# Economic Parameters
+Outcomes.ind=params$endpoint
+if(Outcomes.ind==1){Outcomes="Fatal"}
+
+if(Outcomes.ind==2){Outcomes="Acute"}
+
+
+Input.parameters.EP=data.frame(rbind(params$vsl, params$costPerAcuteCase, params$By,  params$population, params$sdr*100, params$t0, params$tHorizon, params$annualReductionCost, params$controlCostExponent, NA, NA, NA))
+Input.parameters.EP=rbind(Outcomes, Input.parameters.EP)
+rownames.Input.parameters.EP=c("Health Outcome", "VSL", "Cost per acute case", "By", "Population", "Discount rate", "Year 1", "Final year", "ACC<sub>max</sub>", "$\\eta$", "", "", "")
+
+
+blank.vec=rep("", 13)
+Input.all=cbind(rownames.Input.parameters.DR, Input.parameters.DR, blank.vec, rownames.Input.parameters.TTI, Input.parameters.TTI, blank.vec, rownames.Input.parameters.EP, Input.parameters.EP)
+kable(Input.all, col.names = c("Decision Rules and Prior Uncertainty", "Value", "     ", "Toxicity Testing Information", "Value", "     ", "Economic Parameters", "Value") , format.args = list(big.mark = ",", scientific = FALSE), align = "lrclrclr")
+```
+
+```{r, echo=FALSE, include=FALSE}
+if (shiny::isRunning()){ params$progress$set(value=1.0) }
+```

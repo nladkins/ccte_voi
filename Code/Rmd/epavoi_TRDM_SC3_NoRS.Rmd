@@ -1,0 +1,647 @@
+---
+title: "Results for TRDM: Uncertainty present in mean toxicity and exposure"
+author: "Risk Sciences International (prepared under contract XYZ to US Environmental Protection Agency)"
+output: html_document
+
+---
+
+<p> For interpretation of output, please refer to the [user's guide]((insert appropriate url here))
+```{r setup, include = FALSE}
+if (shiny::isRunning()){ params$progress$set(value=0.25) }
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center")
+options(knitr.kable.NA = '')
+
+library(data.table)
+library(FinancialMath)
+library(scales)
+library(microbenchmark)
+library(tidyverse)
+library(knitr)
+
+
+u.range=0.99975
+mu.tox.prior=params$muMeanThreshold
+u.mu.tox.prior.true=u.sd(params$sigmaMeanThreshold, range=u.range)
+u.mu.tox.prior=u.sd(sqrt(params$sigmaMeanThreshold^2+params$sigmaMeanExposure^2), range=u.range)
+sigma.tox.prior=params$muSDThreshold
+mu.exp.prior=params$muMeanExposure
+sigma.exp.prior=params$muSDExposure
+u.sigma.tox.prior=u.sd(params$sigmaSDExposure, range=u.range)
+u.mu.exp.prior=u.sd(params$sigmaMeanExposure, range=u.range)
+u.sigma.exp.prior=u.sd(params$sigmaSDExposure, range=u.range)
+N=params$population
+if(as.numeric(params$endpoint)==1){V=params$vsl*params$By/1e6}
+if(as.numeric(params$endpoint)==2){V=params$costPerAcuteCase*params$By/1e6}
+t.A=params$a_delay
+t.B=params$b_delay
+ICC.A=params$a_costPerTest/1e6
+ICC.B=params$b_costPerTest/1e6
+TRL=params$TRL
+r=params$sdr
+A.range=params$a_sizeThreshold
+B.range=params$b_sizeThreshold
+lcl=params$lcl
+ucl=params$ucl
+y.TH=params$tHorizon-params$t0+1
+max.CC=params$annualReductionCost/1e6/N
+h=params$controlCostExponent
+RS.grid.level=params$RS_included
+
+# Fine-grid
+if(RS.grid.level==1){
+  t1.seq=seq(0, 10, by=1)
+  u.mu.tox.posterior.prop.vec.orig=seq(0, 0.9, by=0.1)
+  rownames.EVDSI.mat=paste("UR = ", seq(100, 0, length.out=11), "%", sep="")
+  colnames.EVDSI.mat=paste("t =", seq(0, 10, by=1), "years", sep=" ")
+  Uncertainty_Reduction=seq(1, 0, by=-0.1)*100
+  Delay=t1.seq
+}
+
+# Coarse-grid
+if(RS.grid.level==3){
+  t1.seq=seq(0, 10, by=2)
+  u.mu.tox.posterior.prop.vec.orig=seq(0, 0.8, by=0.2)
+  rownames.EVDSI.mat=paste("UR = ", seq(100, 0, length.out=6), "%", sep="")
+  colnames.EVDSI.mat=paste("t =", seq(0, 10, by=2), "years", sep=" ")
+  Uncertainty_Reduction=seq(1, 0, by=-0.2)*100
+  Delay=t1.seq
+}
+
+
+# Set up some variables needed for the VOI analysis
+# Set seed for randomization for replicability
+seed=12345
+set.seed(seed)
+
+# Number of replications (B - sample size for prior uncertainty distribution, BB - sample size for sample information)
+LP1=10000
+
+
+# Determine the reduced risk by proportional exposure mitigation strategies
+k.vec=seq(0, 99, length.out=199)/100 # 1% ~ 99% reduction in exposure, by 0.5% increment
+k.vec=c(k.vec, 1-10^(-3:-6), 1) # Further reduction in upper tail
+ER.vec=log10(1-k.vec) # amount of exposure reduction in log10 scale
+ER.mat=matrix(rep(ER.vec, LP1), nrow=LP1, byrow=TRUE)
+
+# Discount rate for HC (for TSC)
+disc.rate.HC.cumsum=disc.rate.HC_cumsum(y.TH, r)
+
+u.range.spacing=0.05
+t.eff=0
+
+# Convert Variables
+u.mu.tox.posterior.A=u.sd(sqrt(A.range^2+params$sigmaMeanExposure^2), u.range)
+u.mu.tox.posterior.B=u.sd(sqrt(B.range^2+params$sigmaMeanExposure^2), u.range)
+u.mu.tox.posterior.PPI=u.sd(params$sigmaMeanExposure, u.range)
+sigma_expr.A=sigma_expr_function(u.mu.tox.posterior.A, u.mu.tox.prior)# For test A
+sigma_expr.B=sigma_expr_function(u.mu.tox.posterior.B, u.mu.tox.prior) # For test B
+sigma_expr.PPI=sigma_expr_function(u.mu.tox.posterior.PPI, u.mu.tox.prior) # For PPI
+
+
+```
+
+
+***
+### VOI analysis for Test A vs. Test B
+```{r TRDM_A_B}
+if (shiny::isRunning()){ params$progress$set(value=0.50) }
+#-----------#
+# For Prior #
+#-----------#
+
+mu.tox=mu.tox.prior
+u.mu.tox=u.mu.tox.prior
+sigma.tox=sigma.tox.prior
+mu.exp=mu.exp.prior
+sigma.exp=sigma.exp.prior
+u.sigma.tox=u.sigma.tox.prior
+u.mu.exp=u.mu.exp.prior
+u.sigma.exp=u.sigma.exp.prior
+t.IC=0
+t.imp=2
+t.eff=0
+for.range.mu.tox.raw=seq(-6, 6, by=u.range.spacing)
+pdf.orig=dnorm(for.range.mu.tox.raw) # Determine the weights for expectation calculation
+pdf=pdf.orig/sum(pdf.orig) # Normalize the empirical pdf
+
+
+ER.option.A=0.9
+
+TRDM.prior.dat=TRDM_function_RS(mu.tox, u.mu.tox, sigma.tox, mu.exp, sigma.exp, t.IC, t.imp, t.eff, for.range.mu.tox.raw, TRL, q.UCL=ucl, q.LCL=lcl, ER.option.A=0.9)
+DRI.PI.R=sum(pdf[which(TRDM.prior.dat$log10.true.risks.option.A$log10.risk.true.original>TRL)])
+DRI.PI.NR=1-sum(pdf[which(TRDM.prior.dat$log10.true.risks.option.A$log10.risk.true.original>TRL)])
+DRI.PI.WA=c(DRI.PI.R, DRI.PI.NR, 1)
+
+
+#----------------------------------------------------#
+
+#------------------------#
+# For Posterior (Test.A) #
+#------------------------#
+
+mu.tox=mu.tox.prior
+N.loop=length(for.range.mu.tox.raw) # Number of realized values
+
+
+# A vector of mu.tox values that will be used to determine the results
+mu.tox.prior.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+# Attempting to obtain unconditional pdf for sample information s_j
+s.j.vec=seq(-15,15, by=u.range.spacing)*u.mu.tox.prior+mu.tox.prior # this is wider than the original uncertainty range to ensure the chance s_j can be more extreme
+f.sj.mu.tox.mat=NULL
+f.sj.vec.orig=NULL
+
+
+sigma_expr=sigma_expr.A
+for(i in 1:length(s.j.vec)){
+  s.j=s.j.vec[i]
+
+  f.sj.mu.tox.vec=NULL
+  for(ii in 1:length(mu.tox.prior.vec)){
+    mu.tox.test=mu.tox.prior.vec[ii]
+    f.sj.mu.tox=dnorm(s.j, mean=mu.tox.test, sd=sigma_expr)
+    f.sj.mu.tox.vec=c(f.sj.mu.tox.vec, f.sj.mu.tox)
+  }
+  # print(sum(f.sj.mu.tox.vec*pdf))
+  f.sj.vec.orig=c(f.sj.vec.orig, sum(f.sj.mu.tox.vec*pdf))
+  f.sj.mu.tox.mat=cbind(f.sj.mu.tox.mat, f.sj.mu.tox.vec)
+}
+
+f.sj.vec=f.sj.vec.orig/sum(f.sj.vec.orig)
+mu.tox.sample.vec=s.j.vec
+
+
+#-------##-------##-------##-------#
+# SET UP VARIABLES FOR TEST.A
+
+# sigma_expr=sigma_expr.A
+u.mu.tox.posterior=u.mu.tox.posterior.A
+
+
+mu.tox.posterior.mat=NULL
+mu.mu.tox.posterior.vec=NULL
+mu.tox.sample.inv.vec=NULL
+
+
+# Find out the sample information value such that the posterior will be evaluated at the same location as prior
+for(i in 1:length(mu.tox.sample.vec)){
+  mu.mu.tox.posterior.vec.dat=Normal_Bayesian_Updating_mean(n.expr=1, sigma_expr=sigma_expr, mu_mu_prior=mu.tox.prior, s_j=mu.tox.sample.vec[i], mu_sigma_prior=u.mu.tox.prior)
+  mu.mu.tox.posterior.vec=c(mu.mu.tox.posterior.vec, mu.mu.tox.posterior.vec.dat$mu_mu_posterior)
+}
+
+
+#-------##-------##-------##-------#
+
+# OBTAIN EV|ISI FOR TEST.A
+
+
+t.IC=0
+posterior.realized.information.summary.df=NULL
+for.local.ETSC=NULL
+TSC.true.mat=NULL
+ETSC.vec=NULL
+post.dat.mat=NULL
+for(i in 1:length(mu.mu.tox.posterior.vec)){
+  # print(i)
+  mu.tox.posterior.vec=for.range.mu.tox.raw*u.mu.tox.posterior+mu.mu.tox.posterior.vec[i]
+  dat=TRDM_function_RS(mu.mu.tox.posterior.vec[i], u.mu.tox.posterior, sigma.tox, mu.exp, sigma.exp, t.IC, t.imp, t.eff, for.range.mu.tox.raw, TRL, q.UCL=ucl, q.LCL=lcl, ER.option.A=0.9)
+  post.dat=c(dat$DRI, 10^dat$log10.risk.original.WA, 10^dat$log10.risk.option.A.WA, 10^dat$log10.risk.true.option.A.WA)
+  post.dat.mat=rbind(post.dat.mat, post.dat)
+}
+
+post.dat.df=as.data.frame(cbind(post.dat.mat, f.sj.vec))
+colnames(post.dat.df)=c("DRI", "risk.original.WA", "risk.option.A.WA", "risk.true.option.A.WA", "f.sj")
+
+
+#-------##-------##-------##-------#
+
+DRI.A.i.WA=as.numeric(post.dat.mat[,1]*post.dat.df$f.sj)
+loc.R=which(DRI.A.i.WA>0)
+loc.NR=which(DRI.A.i.WA<0)
+loc.INC=which(DRI.A.i.WA==0)
+prob.DRI.A.i.WA.R=prob.DRI.A.i.WA.NR=prob.DRI.A.i.WA.INC=0
+if(length(loc.R)>0){
+  prob.DRI.A.i.WA.R=sum(DRI.A.i.WA[loc.R])
+}
+if(length(loc.NR)>0){
+  prob.DRI.A.i.WA.NR=-sum(DRI.A.i.WA[loc.NR])
+}
+prob.DRI.A.i.WA.INC=1-prob.DRI.A.i.WA.R-prob.DRI.A.i.WA.NR
+
+DRI.A.WA=c(prob.DRI.A.i.WA.R, prob.DRI.A.i.WA.NR, prob.DRI.A.i.WA.INC)
+DRI.A.WA.alt=c(prob.DRI.A.i.WA.R, prob.DRI.A.i.WA.NR, 1-prob.DRI.A.i.WA.INC)
+
+#-------##-------##-------##-------#
+
+DRI.01=post.dat.df$DRI
+loc.DRI.01.R=which(DRI.01==1)
+loc.DRI.01.NR.INC=which(DRI.01<=0)
+
+
+# Unregulated risk based on prior information
+R.prior=10^(TRDM.prior.dat$log10.risk.original.WA)
+
+# Posterior risk with regulation (when DRI=1)
+R.posterior.A=sum(post.dat.df$risk.option.A.WA[loc.DRI.01.R]*f.sj.vec[loc.DRI.01.R])+sum(post.dat.df$risk.original.WA[loc.DRI.01.NR.INC]*f.sj.vec[loc.DRI.01.NR.INC])
+
+#----------------------------------------------------#
+#------------------------#
+# For Posterior (Test.B) #
+#------------------------#
+
+mu.tox=mu.tox.prior
+N.loop=length(for.range.mu.tox.raw) # Number of realized values
+
+
+# A vector of mu.tox values that will be used to determine the results
+mu.tox.prior.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+# Attempting to obtain unconditional pdf for sample information s_j
+s.j.vec=seq(-15,15, by=u.range.spacing)*u.mu.tox.prior+mu.tox.prior # this is wider than the original uncertainty range to ensure the chance s_j can be more extreme
+f.sj.mu.tox.mat=NULL
+f.sj.vec.orig=NULL
+
+
+sigma_expr=sigma_expr.B
+for(i in 1:length(s.j.vec)){
+  s.j=s.j.vec[i]
+
+  f.sj.mu.tox.vec=NULL
+  for(ii in 1:length(mu.tox.prior.vec)){
+    mu.tox.test=mu.tox.prior.vec[ii]
+    f.sj.mu.tox=dnorm(s.j, mean=mu.tox.test, sd=sigma_expr)
+    f.sj.mu.tox.vec=c(f.sj.mu.tox.vec, f.sj.mu.tox)
+  }
+  f.sj.vec.orig=c(f.sj.vec.orig, sum(f.sj.mu.tox.vec*pdf))
+  f.sj.mu.tox.mat=cbind(f.sj.mu.tox.mat, f.sj.mu.tox.vec)
+}
+
+f.sj.vec=f.sj.vec.orig/sum(f.sj.vec.orig)
+mu.tox.sample.vec=s.j.vec
+
+
+#-------##-------##-------##-------#
+# SET UP VARIABLES FOR TEST.B
+
+# sigma_expr=sigma_expr.B
+u.mu.tox.posterior=u.mu.tox.posterior.B
+
+
+mu.tox.posterior.mat=NULL
+mu.mu.tox.posterior.vec=NULL
+mu.tox.sample.inv.vec=NULL
+
+
+# Find out the sample information value such that the posterior will be evaluated at the same location as prior
+for(i in 1:length(mu.tox.sample.vec)){
+  mu.mu.tox.posterior.vec.dat=Normal_Bayesian_Updating_mean(n.expr=1, sigma_expr=sigma_expr, mu_mu_prior=mu.tox.prior, s_j=mu.tox.sample.vec[i], mu_sigma_prior=u.mu.tox.prior)
+  mu.mu.tox.posterior.vec=c(mu.mu.tox.posterior.vec, mu.mu.tox.posterior.vec.dat$mu_mu_posterior)
+}
+
+
+#-------##-------##-------##-------#
+
+# OBTAIN EV|ISI FOR TEST.B
+
+
+t.IC=0
+posterior.realized.information.summary.df=NULL
+for.local.ETSC=NULL
+TSC.true.mat=NULL
+ETSC.vec=NULL
+post.dat.mat=NULL
+for(i in 1:length(mu.mu.tox.posterior.vec)){
+  # print(i)
+  mu.tox.posterior.vec=for.range.mu.tox.raw*u.mu.tox.posterior+mu.mu.tox.posterior.vec[i]
+  dat=TRDM_function_RS(mu.mu.tox.posterior.vec[i], u.mu.tox.posterior, sigma.tox, mu.exp, sigma.exp, t.IC, t.imp, t.eff, for.range.mu.tox.raw, TRL, q.UCL=ucl, q.LCL=lcl, ER.option.A=0.9)
+  post.dat=c(dat$DRI, 10^dat$log10.risk.original.WA, 10^dat$log10.risk.option.A.WA, 10^dat$log10.risk.true.option.A.WA)
+  post.dat.mat=rbind(post.dat.mat, post.dat)
+}
+
+post.dat.df=as.data.frame(cbind(post.dat.mat, f.sj.vec))
+colnames(post.dat.df)=c("DRI", "risk.original.WA", "risk.option.A.WA", "risk.true.option.A.WA", "f.sj")
+
+
+#-------##-------##-------##-------#
+
+DRI.B.i.WA=as.numeric(post.dat.mat[,1]*post.dat.df$f.sj)
+loc.R=which(DRI.B.i.WA>0)
+loc.NR=which(DRI.B.i.WA<0)
+loc.INC=which(DRI.B.i.WA==0)
+prob.DRI.B.i.WA.R=prob.DRI.B.i.WA.NR=prob.DRI.B.i.WA.INC=0
+if(length(loc.R)>0){
+  prob.DRI.B.i.WA.R=sum(DRI.B.i.WA[loc.R])
+}
+if(length(loc.NR)>0){
+  prob.DRI.B.i.WA.NR=-sum(DRI.B.i.WA[loc.NR])
+}
+prob.DRI.B.i.WA.INC=1-prob.DRI.B.i.WA.R-prob.DRI.B.i.WA.NR
+
+DRI.B.WA=c(prob.DRI.B.i.WA.R, prob.DRI.B.i.WA.NR, prob.DRI.B.i.WA.INC)
+DRI.B.WA.alt=c(prob.DRI.B.i.WA.R, prob.DRI.B.i.WA.NR, 1-prob.DRI.B.i.WA.INC)
+
+#-------##-------##-------##-------#
+
+DRI.01=post.dat.df$DRI
+loc.DRI.01.R=which(DRI.01==1)
+loc.DRI.01.NR.INC=which(DRI.01<=0)
+
+
+# Posterior risk with regulation (when DRI=1)
+R.posterior.B=sum(post.dat.df$risk.option.A.WA[loc.DRI.01.R]*f.sj.vec[loc.DRI.01.R])+sum(post.dat.df$risk.original.WA[loc.DRI.01.NR.INC]*f.sj.vec[loc.DRI.01.NR.INC])
+
+
+#----------------------------------------------------#
+#------------------------#
+# For Posterior (Test.PPI) #
+#------------------------#
+
+mu.tox=mu.tox.prior
+N.loop=length(for.range.mu.tox.raw) # Number of realized values
+
+
+# A vector of mu.tox values that will be used to determine the results
+mu.tox.prior.vec=for.range.mu.tox.raw*u.mu.tox+mu.tox
+
+
+# Attempting to obtain unconditional pdf for sample information s_j
+s.j.vec=seq(-15,15, by=u.range.spacing)*u.mu.tox.prior+mu.tox.prior # this is wider than the original uncertainty range to ensure the chance s_j can be more extreme
+f.sj.mu.tox.mat=NULL
+f.sj.vec.orig=NULL
+
+
+sigma_expr=sigma_expr.PPI
+for(i in 1:length(s.j.vec)){
+  s.j=s.j.vec[i]
+
+  f.sj.mu.tox.vec=NULL
+  for(ii in 1:length(mu.tox.prior.vec)){
+    mu.tox.test=mu.tox.prior.vec[ii]
+    f.sj.mu.tox=dnorm(s.j, mean=mu.tox.test, sd=sigma_expr)
+    f.sj.mu.tox.vec=c(f.sj.mu.tox.vec, f.sj.mu.tox)
+  }
+  f.sj.vec.orig=c(f.sj.vec.orig, sum(f.sj.mu.tox.vec*pdf))
+  f.sj.mu.tox.mat=cbind(f.sj.mu.tox.mat, f.sj.mu.tox.vec)
+}
+
+f.sj.vec=f.sj.vec.orig/sum(f.sj.vec.orig)
+mu.tox.sample.vec=s.j.vec
+
+
+#-------##-------##-------##-------#
+# SET UP VARIABLES FOR TEST.PPI
+
+# sigma_expr=sigma_expr.PPI
+u.mu.tox.posterior=u.mu.tox.posterior.PPI
+
+
+mu.tox.posterior.mat=NULL
+mu.mu.tox.posterior.vec=NULL
+mu.tox.sample.inv.vec=NULL
+
+
+# Find out the sample information value such that the posterior will be evaluated at the same location as prior
+for(i in 1:length(mu.tox.sample.vec)){
+  mu.mu.tox.posterior.vec.dat=Normal_Bayesian_Updating_mean(n.expr=1, sigma_expr=sigma_expr, mu_mu_prior=mu.tox.prior, s_j=mu.tox.sample.vec[i], mu_sigma_prior=u.mu.tox.prior)
+  mu.mu.tox.posterior.vec=c(mu.mu.tox.posterior.vec, mu.mu.tox.posterior.vec.dat$mu_mu_posterior)
+}
+
+
+#-------##-------##-------##-------#
+
+# OBTAIN EV|ISI FOR TEST.PPI
+
+
+t.IC=0
+posterior.realized.information.summary.df=NULL
+for.local.ETSC=NULL
+TSC.true.mat=NULL
+ETSC.vec=NULL
+post.dat.mat=NULL
+for(i in 1:length(mu.mu.tox.posterior.vec)){
+  # print(i)
+  mu.tox.posterior.vec=for.range.mu.tox.raw*u.mu.tox.posterior+mu.mu.tox.posterior.vec[i]
+  dat=TRDM_function_RS(mu.mu.tox.posterior.vec[i], u.mu.tox.posterior, sigma.tox, mu.exp, sigma.exp, t.IC, t.imp, t.eff, for.range.mu.tox.raw, TRL, q.UCL=ucl, q.LCL=lcl, ER.option.A=0.9)
+  post.dat=c(dat$DRI, 10^dat$log10.risk.original.WA, 10^dat$log10.risk.option.A.WA, 10^dat$log10.risk.true.option.A.WA)
+  post.dat.mat=rbind(post.dat.mat, post.dat)
+}
+
+post.dat.df=as.data.frame(cbind(post.dat.mat, f.sj.vec))
+colnames(post.dat.df)=c("DRI", "risk.original.WA", "risk.option.A.WA", "risk.true.option.A.WA", "f.sj")
+
+
+#-------##-------##-------##-------#
+
+DRI.PPI.i.WA=as.numeric(post.dat.mat[,1]*post.dat.df$f.sj)
+loc.R=which(DRI.PPI.i.WA>0)
+loc.NR=which(DRI.PPI.i.WA<0)
+loc.INC=which(DRI.PPI.i.WA==0)
+prob.DRI.PPI.i.WA.R=prob.DRI.PPI.i.WA.NR=prob.DRI.PPI.i.WA.INC=0
+if(length(loc.R)>0){
+  prob.DRI.PPI.i.WA.R=sum(DRI.PPI.i.WA[loc.R])
+}
+if(length(loc.NR)>0){
+  prob.DRI.PPI.i.WA.NR=-sum(DRI.PPI.i.WA[loc.NR])
+}
+prob.DRI.PPI.i.WA.INC=1-prob.DRI.PPI.i.WA.R-prob.DRI.PPI.i.WA.NR
+
+DRI.PPI.WA=c(prob.DRI.PPI.i.WA.R, prob.DRI.PPI.i.WA.NR, prob.DRI.PPI.i.WA.INC)
+DRI.PPI.WA.alt=c(prob.DRI.PPI.i.WA.R, prob.DRI.PPI.i.WA.NR, 1-prob.DRI.PPI.i.WA.INC)
+
+#-------##-------##-------##-------#
+
+DRI.01=post.dat.df$DRI
+loc.DRI.01.R=which(DRI.01==1)
+loc.DRI.01.NR.INC=which(DRI.01<=0)
+
+
+# Posterior risk with regulation (when DRI=1)
+R.posterior.PPI=sum(post.dat.df$risk.option.A.WA[loc.DRI.01.R]*f.sj.vec[loc.DRI.01.R])+sum(post.dat.df$risk.original.WA[loc.DRI.01.NR.INC]*f.sj.vec[loc.DRI.01.NR.INC])
+
+
+#----------------------------------------------------#
+#----------------#
+# Health Benefit #
+#  Computation   #
+#----------------#
+
+# This is the proportion of benefit accrued depending on the time of implementation taking EFFECT
+# NOTE: This will be used for SUBTRCTING the Health Cost by reduced risk
+post.mit.accrue=disc.rate.HC.cumsum$disc.rate.inv.cumsum[,2]
+
+#---------------------------#
+# For Immediate Information #
+#---------------------------#
+
+# Acquire timeline
+y.imp=1+t.imp+0
+y.eff=y.imp+t.eff
+
+HC.accrue.CI=N*V*R.prior*disc.rate.HC.cumsum$disc.rate.inv.cumsum[1,2]
+
+# Health benefit observed (y.imp is used so that there is no delay in appreciating benefit)
+IHB.accrue.PPI=N*V*(R.prior-R.posterior.PPI)*post.mit.accrue[y.imp]
+
+# Health benefit observed (y.imp is used so that there is no delay in appreciating benefit)
+IHB.accrue.A=N*V*(R.prior-R.posterior.A)*post.mit.accrue[y.imp]
+
+# Health benefit observed (y.imp is used so that there is no delay in appreciating benefit)
+IHB.accrue.B=N*V*(R.prior-R.posterior.B)*post.mit.accrue[y.imp]
+
+#-------------------------#
+# For Delayed Information #
+#-------------------------#
+
+# Acquire timeline
+y.imp=1+t.imp+t.A
+y.eff=y.imp+t.eff
+
+
+# Health benefit observed (y.imp is used so that there is no delay in appreciating benefit)
+DHB.accrue.A=N*V*(R.prior-R.posterior.A)*post.mit.accrue[y.imp]
+
+# Acquire timeline
+y.imp=1+t.imp+t.B
+y.eff=y.imp+t.eff
+
+# Health benefit observed (y.imp is used so that there is no delay in appreciating benefit)
+DHB.accrue.B=N*V*(R.prior-R.posterior.B)*post.mit.accrue[y.imp]
+
+#----------------------------------------------------#
+#----------------------------------------------------#
+
+#--------#
+# OUTPUT #
+#--------#
+
+EVIPPI=IHB.accrue.PPI
+EVISI.A=IHB.accrue.A
+EVISI.B=IHB.accrue.B
+EVDSI.A=DHB.accrue.A
+EVDSI.B=DHB.accrue.B
+CoD.A=EVISI.A-EVDSI.A
+CoD.B=EVISI.B-EVDSI.B
+ENBS.A=EVDSI.A-ICC.A
+ENBS.B=EVDSI.B-ICC.B
+ROI.A=ENBS.A/ICC.A
+ROI.B=ENBS.B/ICC.B
+
+
+HC.accrue.CI.fmt=round(HC.accrue.CI)
+EVIPPI.fmt=round(EVIPPI)
+EVISI.A.perc=round(100*EVISI.A/EVIPPI)
+EVDSI.A.perc=round(100*EVDSI.A/EVIPPI)
+EVISI.B.perc=round(100*EVISI.B/EVIPPI)
+EVDSI.B.perc=round(100*EVDSI.B/EVIPPI)
+EVISI.A.fmt=round(EVISI.A)
+EVDSI.A.fmt=round(EVDSI.A)
+EVISI.B.fmt=round(EVISI.B)
+EVDSI.B.fmt=round(EVDSI.B)
+CoD.A.fmt=round(CoD.A)
+CoD.B.fmt=round(CoD.B)
+CoD.A.perc=round(100*CoD.A/EVIPPI)
+CoD.B.perc=round(100*CoD.B/EVIPPI)
+ENBS.A.fmt=round(ENBS.A)
+ENBS.A.perc=round(100*ENBS.A/EVIPPI)
+ENBS.B.fmt=round(ENBS.B)
+ENBS.B.perc=round(100*ENBS.B/EVIPPI)
+ROI.A.fmt=round(ROI.A)
+ROI.B.fmt=round(ROI.B)
+
+VOI.summary=rbind(c(HC.accrue.CI.fmt, rep(NA, 3)), c(EVIPPI.fmt, rep(NA, 3)),
+                   c(EVISI.A.fmt, EVISI.A.perc, EVISI.B.fmt, EVISI.B.perc), c(CoD.A.fmt, CoD.A.perc, CoD.B.fmt, CoD.B.perc),
+                   c(EVDSI.A.fmt, EVDSI.A.perc, EVDSI.B.fmt, EVDSI.B.perc), c(ENBS.A.fmt, ENBS.A.perc, ENBS.B.fmt, ENBS.B.perc),
+                   c(ROI.A.fmt, NA, ROI.B.fmt, NA))
+
+rownames(VOI.summary)=c("EV|CI", "EVIPPI", "EVISI", "CoD", "EVDSI", "ENBS", "ROI")
+
+
+# Formatting VOI summary information (EV|CI and EVIPPI)
+VOI.summary.prior.information=rbind(HC.accrue.CI.fmt, EVIPPI.fmt)
+colnames(VOI.summary.prior.information)=c("(&#x0024;M)")
+rownames(VOI.summary.prior.information)=c(paste("Expected Value Given Current Information (EV\U007C", "CI)", sep=""), "Expected Value of Immediate Partial Perfect Information (EVIPPI)")
+kable(VOI.summary.prior.information, caption="VOI summary (part 1) - Current information and immediate perfect information", format.args = list(big.mark = ","))
+
+# Formatting VOI summary information for Test A and Test B (EVISI,...,ROI)
+VOI.summary.posterior.information=rbind(c(EVISI.A.fmt, EVISI.A.perc, EVISI.B.fmt, EVISI.B.perc), c(CoD.A.fmt, CoD.A.perc, CoD.B.fmt, CoD.B.perc),
+                   c(EVDSI.A.fmt, EVDSI.A.perc, EVDSI.B.fmt, EVDSI.B.perc), c(ENBS.A.fmt, ENBS.A.perc, ENBS.B.fmt, ENBS.B.perc),
+                   c(ROI.A.fmt, NA, ROI.B.fmt, NA))
+
+
+colnames(VOI.summary.posterior.information)=c(paste("Test A (&#x0024;", "M)", sep=""), paste("Test A (&#x0025;", ")", sep=""), paste("Test B (&#x0024;", "M)", sep=""), paste("Test B (&#x0025;", ")", sep=""))
+rownames(VOI.summary.posterior.information)=c("Expected Value of Immediate Sample Information (EVISI)", "Cost of Delay (CoD)", "Expected Value of Delayed Sample Information (EVDSI)", "Expected Net Benefit of Sampling (ENBS)", "Return on Investment (ROI)")
+
+
+
+kable(VOI.summary.posterior.information, caption="VOI summary (part 2) - Test A vs. Test B (% given with respect to EVIPPI)", escape=FALSE, align = rep("r", 4), format.args = list(big.mark = ","))
+
+DRI.summary=rbind(DRI.PPI.WA.alt, DRI.A.WA.alt, DRI.B.WA.alt)
+DRI.summary.signif=signif(DRI.summary*100, digits=3)
+colnames(DRI.summary.signif)=c("P(decision to regulate) (&#x0025;)", "P(decision not to regulate) (&#x0025;)", "P(decision made) (&#x0025;)")
+rownames(DRI.summary.signif)=c("With partial perfect information", "With Test A", "With Test B")
+kable(DRI.summary.signif, caption="VOI summary (part 3) - Probability of making decisions", escape=FALSE)
+
+```
+
+
+<div style="margin-bottom:100px;">
+***
+### Response Surface Analysis
+Response surface analysis not conducted.
+```{r Response_Surface_Plot, echo=FALSE}
+if (shiny::isRunning()){ params$progress$set(value=0.75) }
+#print("Response surface analysis not conducted.")
+
+```
+
+
+<div style="margin-bottom:100px;">
+***
+### List of input parameters
+```{r Outputting_Input}
+
+# Decision Rules and Prior Uncertainty
+DR.ind=params$decisionRule
+if(DR.ind==1){DR="BRDM"}
+if(DR.ind==2){DR="TRDM"}
+RS.ind=params$RS_included
+if(RS.ind==1){RS="Yes (with fine-grid)"}
+if(RS.ind==2){RS="No"}
+if(RS.ind==3){RS="Yes (with coarse-grid)"}
+
+Input.parameters.DR=data.frame(rbind(params$TRL, params$ucl, params$lcl, params$muMeanThreshold, params$sigmaMeanThreshold, params$muSDThreshold, params$sigmaSDThreshold, params$muMeanExposure, params$sigmaMeanExposure, params$muSDExposure, params$sigmaSDExposure))
+Input.parameters.DR=rbind(DR, RS, Input.parameters.DR)
+rownames.Input.parameters.DR=c("Decision rule", "Response surface", "TRL", "UCL", "LCL", "$\\mu$<sub>tox</sub>", "Range[u<sup>0</sup>($\\mu$<sub>tox</sub>)]", "$\\sigma$<sub>tox</sub>", "Range[u<sup>0</sup>($\\sigma$<sub>tox</sub>)]", "$\\mu$<sub>exp</sub>", "Range[u<sup>0</sup>($\\mu$<sub>exp</sub>)]", "$\\sigma$<sub>exp</sub>", "Range[u<sup>0</sup>($\\sigma$<sub>exp</sub>)]")
+colnames(Input.parameters.DR)="Value"
+
+
+# Toxicity Test Information
+Input.parameters.TTI=data.frame(rbind(params$a_sizeThreshold, params$a_delay, params$a_costPerTest, params$b_sizeThreshold, params$b_delay, params$b_costPerTest))
+Input.parameters.TTI=rbind(Input.parameters.TTI, NA, NA, NA, NA, NA, NA, NA)
+rownames.Input.parameters.TTI=c("Range[u<sup>A</sup>($\\mu$<sub>tox</sub>)]", "Delay (Test A)", "Cost per test (Test A)", "Range[u<sup>B</sup>($\\mu$<sub>tox</sub>)]", "Delay (Test B)", "Cost per test (Test B)", rep("", 7))
+colnames(Input.parameters.TTI)="Value"
+
+
+# Economic Parameters
+Outcomes.ind=params$endpoint
+if(Outcomes.ind==1){Outcomes="Fatal"}
+
+if(Outcomes.ind==2){Outcomes="Acute"}
+
+
+Input.parameters.EP=data.frame(rbind(params$vsl,  params$costPerAcuteCase, params$By,  params$population, params$sdr*100, params$t0, params$tHorizon, params$annualReductionCost, params$controlCostExponent, NA, NA, NA))
+Input.parameters.EP=rbind(Outcomes, Input.parameters.EP)
+rownames.Input.parameters.EP=c("Health Outcome", "VSL", "Cost per acute case", "By", "Population", "Discount rate", "Year 1", "Final year", "ACC<sub>max</sub>", "$\\eta$", "", "", "")
+
+
+blank.vec=rep("", 13)
+Input.all=cbind(rownames.Input.parameters.DR, Input.parameters.DR, blank.vec, rownames.Input.parameters.TTI, Input.parameters.TTI, blank.vec, rownames.Input.parameters.EP, Input.parameters.EP)
+
+kable(Input.all, col.names = c("Decision Rules and Prior Uncertainty", "Value", "     ", "Toxicity Testing Information", "Value", "     ", "Economic Parameters", "Value") , format.args = list(big.mark = ",", scientific = FALSE), align = "lrclrclr")
+```
+
+```{r, echo=FALSE, include=FALSE}
+if (shiny::isRunning()){ params$progress$set(value=1.0) }
+```
